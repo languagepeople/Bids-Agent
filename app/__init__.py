@@ -1,0 +1,1 @@
+# Bids Agent application package

@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Bids Agent — Lead Generation</title>
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+
+<!-- ═══════════════════════════ HEADER ══════════════════════════════════════ -->
+<header>
+  <div class="header-inner">
+    <div class="logo">
+      <span class="logo-icon">🔎</span>
+      <span class="logo-text">Bids Agent</span>
+      <span class="logo-sub">Lead Generation</span>
+    </div>
+    <nav class="top-nav">
+      <button class="nav-btn active" data-panel="search">Search</button>
+      <button class="nav-btn" data-panel="results">Results</button>
+      <button class="nav-btn" data-panel="history">History</button>
+      <button class="nav-btn" data-panel="mappings">Mappings</button>
+    </nav>
+  </div>
+</header>
+
+<!-- ═══════════════════════════ PANELS ══════════════════════════════════════ -->
+<main>
+
+  <!-- ─────────────────── SEARCH PANEL ──────────────────────────────────── -->
+  <section id="panel-search" class="panel active">
+    <div class="panel-header">
+      <h2>Configure &amp; Run Search</h2>
+      <p class="panel-desc">Select keywords, document types, and data sources, then click <strong>Search</strong>.</p>
+    </div>
+
+    <div class="search-grid">
+
+      <!-- Keywords -->
+      <div class="card">
+        <h3 class="card-title">🏷️ Keywords</h3>
+        <div class="keyword-presets" id="keyword-presets">
+          <!-- filled by JS -->
+        </div>
+        <div class="custom-keyword-row">
+          <input id="keyword-input" type="text" placeholder="Add custom keyword…" />
+          <button id="btn-add-keyword" class="btn btn-sm btn-secondary">Add</button>
+        </div>
+        <div class="selected-keywords" id="selected-keywords">
+          <!-- chips filled by JS -->
+        </div>
+      </div>
+
+      <!-- Search Types -->
+      <div class="card">
+        <h3 class="card-title">📄 Document Types</h3>
+        <div class="checkbox-group" id="search-types">
+          <label for="type-rfp"><input type="checkbox" id="type-rfp" value="RFP" checked /> RFP — Request for Proposal</label>
+          <label for="type-rfq"><input type="checkbox" id="type-rfq" value="RFQ" checked /> RFQ — Request for Quotation</label>
+          <label for="type-rfi"><input type="checkbox" id="type-rfi" value="RFI" checked /> RFI — Request for Information</label>
+          <label for="type-bid"><input type="checkbox" id="type-bid" value="Bid" checked /> Bid / Solicitation</label>
+        </div>
+      </div>
+
+      <!-- Sources -->
+      <div class="card">
+        <h3 class="card-title">🌐 Data Sources</h3>
+        <div class="checkbox-group" id="sources-list">
+          <!-- filled by JS -->
+        </div>
+      </div>
+
+      <!-- Options -->
+      <div class="card">
+        <h3 class="card-title">⚙️ Options</h3>
+        <label class="field-label" for="max-results">Max results per source</label>
+        <input id="max-results" type="number" value="25" min="5" max="100" />
+      </div>
+
+    </div><!-- .search-grid -->
+
+    <div class="search-actions">
+      <button id="btn-search" class="btn btn-primary btn-lg">
+        <span class="btn-icon">🔍</span> Search
+      </button>
+      <div id="search-status" class="search-status"></div>
+    </div>
+
+    <!-- Quick preview of last search -->
+    <div id="search-preview" class="search-preview hidden">
+      <h3>Preview — <span id="preview-count">0</span> results found</h3>
+      <div id="preview-table-wrap"></div>
+      <div class="preview-actions">
+        <button class="btn btn-secondary" id="btn-goto-results">View All Results →</button>
+        <button class="btn btn-success" id="btn-quick-export">Export to Excel ⬇</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─────────────────── RESULTS PANEL ─────────────────────────────────── -->
+  <section id="panel-results" class="panel">
+    <div class="panel-header">
+      <h2>Search Results</h2>
+      <div class="panel-header-actions">
+        <select id="results-search-filter" class="select-sm">
+          <option value="">All searches</option>
+        </select>
+        <button class="btn btn-success" id="btn-export-selected">Export Selected ⬇</button>
+        <button class="btn btn-success" id="btn-export-all">Export All ⬇</button>
+      </div>
+    </div>
+
+    <!-- Column mapping chooser -->
+    <div class="mapping-bar">
+      <span class="mapping-label">Column mapping:</span>
+      <select id="mapping-select" class="select-sm">
+        <option value="">Default mapping</option>
+      </select>
+      <button class="btn btn-sm btn-secondary" id="btn-open-mapper">Customize…</button>
+    </div>
+
+    <div id="results-table-wrap">
+      <p class="empty-state">Run a search to see results here.</p>
+    </div>
+  </section>
+
+  <!-- ─────────────────── HISTORY PANEL ─────────────────────────────────── -->
+  <section id="panel-history" class="panel">
+    <div class="panel-header">
+      <h2>Search History</h2>
+      <p class="panel-desc">All past searches are stored locally in the database.</p>
+    </div>
+    <div id="history-table-wrap">
+      <p class="empty-state">No searches yet.</p>
+    </div>
+  </section>
+
+  <!-- ─────────────────── MAPPINGS PANEL ────────────────────────────────── -->
+  <section id="panel-mappings" class="panel">
+    <div class="panel-header">
+      <h2>Column Mappings</h2>
+      <p class="panel-desc">Save reusable mappings from result fields to Excel column names.</p>
+      <button class="btn btn-primary" id="btn-new-mapping">+ New Mapping</button>
+    </div>
+    <div id="mappings-list-wrap">
+      <p class="empty-state">No saved mappings yet.</p>
+    </div>
+  </section>
+
+</main>
+
+<!-- ═══════════════════════ COLUMN MAPPER MODAL ═════════════════════════════ -->
+<div id="modal-mapper" class="modal hidden">
+  <div class="modal-backdrop" id="modal-backdrop"></div>
+  <div class="modal-dialog">
+    <div class="modal-header">
+      <h3>Column Mapping Editor</h3>
+      <button class="modal-close" id="btn-modal-close">✕</button>
+    </div>
+    <div class="modal-body">
+      <p>Drag result fields on the left onto Excel column slots on the right, or use the dropdowns.</p>
+
+      <div class="mapper-grid">
+        <!-- Available fields (draggable) -->
+        <div class="mapper-col">
+          <h4>Available Fields</h4>
+          <div id="mapper-fields" class="field-list"></div>
+        </div>
+
+        <!-- Excel columns (drop targets) -->
+        <div class="mapper-col">
+          <h4>Excel Columns</h4>
+          <div id="mapper-columns" class="column-list">
+            <!-- Rows added by JS -->
+          </div>
+          <button class="btn btn-sm btn-secondary" id="btn-add-col">+ Add Column</button>
+        </div>
+      </div>
+
+      <div class="save-mapping-row">
+        <label class="field-label" for="mapping-name-input">Save as:</label>
+        <input id="mapping-name-input" type="text" placeholder="My Mapping Name" />
+        <button class="btn btn-primary" id="btn-save-mapping">Save Mapping</button>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" id="btn-apply-mapping">Apply to Export</button>
+      <button class="btn btn-ghost" id="btn-reset-mapping">Reset to Default</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════ TOAST NOTIFICATION ══════════════════════════════ -->
+<div id="toast" class="toast hidden"></div>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>
