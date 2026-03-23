@@ -6,6 +6,8 @@
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const DESC_PREVIEW_LENGTH = 120;
+// Must match DIAG_PREVIEW_CHARS in app/scrapers/base_scraper.py
+const DIAG_PREVIEW_CHARS = 600;
 
 // ─── State ────────────────────────────────────────────────────────────────────
 const state = {
@@ -185,11 +187,20 @@ async function runSearch() {
     state.currentSearchId = data.search_id;
     state.currentResults  = data.results || [];
 
-    status.textContent = `✔ Found ${data.count} result(s)`;
-    status.className   = "search-status";
+    const sourceErrors = data.source_errors || {};
+    const errorCount = Object.keys(sourceErrors).filter(k => sourceErrors[k]).length;
 
-    showPreview(state.currentResults);
-    toast(`Search complete — ${data.count} result(s) found.`, "success");
+    if (data.count > 0) {
+      status.textContent = `✔ Found ${data.count} result(s)`;
+      status.className   = "search-status";
+      toast(`Search complete — ${data.count} result(s) found.${errorCount ? ` (${errorCount} source(s) had errors)` : ""}`, "success");
+    } else {
+      status.textContent = `⚠ 0 results — check source errors below`;
+      status.className   = "search-status error";
+      toast("Search returned 0 results. See source error details below.", "error");
+    }
+
+    showPreview(state.currentResults, sourceErrors, keywords, searchTypes);
   } catch (err) {
     status.textContent = `Error: ${err.message}`;
     status.className   = "search-status error";
@@ -201,12 +212,46 @@ async function runSearch() {
 }
 
 // ─── Preview ──────────────────────────────────────────────────────────────────
-function showPreview(results) {
+function showPreview(results, sourceErrors, keywords, searchTypes) {
   const wrap = document.getElementById("search-preview");
   document.getElementById("preview-count").textContent = results.length;
   const tableWrap = document.getElementById("preview-table-wrap");
-  // Show first 5 results as a simple preview
-  tableWrap.innerHTML = buildResultsTable(results.slice(0, 5), { showSelect: false });
+  tableWrap.innerHTML = results.length
+    ? buildResultsTable(results.slice(0, 5), { showSelect: false })
+    : '<p class="empty-state" style="padding:.75rem 0">No results found for this search.</p>';
+
+  // ── Source error banner ──────────────────────────────────────────────────
+  const banner = document.getElementById("source-errors-banner");
+  const errorEntries = Object.entries(sourceErrors || {}).filter(([, msg]) => msg);
+  if (errorEntries.length) {
+    let html = '<h4>⚠ Source Issues Detected</h4>';
+    errorEntries.forEach(([sourceKey, msg]) => {
+      const label = _sourceLabel(sourceKey);
+      html += `<div class="source-error-item">
+        <span class="source-error-label">${escHtml(label)}:</span>
+        <span class="source-error-msg">${escHtml(msg)}</span>
+        <button class="btn btn-sm btn-secondary btn-diag"
+                data-source="${escHtml(sourceKey)}"
+                data-keywords="${escHtml(keywords || "")}"
+                data-types='${JSON.stringify(searchTypes || [])}'>
+          🔬 Diagnose
+        </button>
+      </div>`;
+    });
+    banner.innerHTML = html;
+    banner.classList.remove("hidden");
+
+    banner.querySelectorAll(".btn-diag").forEach(btn => {
+      btn.addEventListener("click", () => {
+        let types = [];
+        try { types = JSON.parse(btn.dataset.types); } catch { /* ignore */ }
+        openDebugModal(btn.dataset.source, btn.dataset.keywords, types);
+      });
+    });
+  } else {
+    banner.classList.add("hidden");
+  }
+
   wrap.classList.remove("hidden");
 }
 
@@ -676,6 +721,139 @@ document.getElementById("mapping-select").addEventListener("change", () => {
 
 document.getElementById("btn-open-mapper").addEventListener("click", openMapperModal);
 
+// ─── Debug Modal ──────────────────────────────────────────────────────────────
+async function openDebugModal(sourceKey, keywords, searchTypes) {
+  const modal = document.getElementById("modal-debug");
+  const body  = document.getElementById("debug-body");
+  modal.classList.remove("hidden");
+  body.innerHTML = `<p>Running diagnostics for <strong>${escHtml(_sourceLabel(sourceKey))}</strong>… <span class="spinner" style="border-color:rgba(0,0,0,.2);border-top-color:#1F4E79;display:inline-block;"></span></p>`;
+
+  try {
+    const diag = await apiPost("/debug/scraper", {
+      source: sourceKey,
+      keywords: keywords,
+      search_types: searchTypes,
+    });
+    body.innerHTML = buildDiagHtml(diag, sourceKey);
+  } catch (err) {
+    body.innerHTML = `<p class="debug-val err">Diagnostics request failed: ${escHtml(err.message)}</p>`;
+  }
+}
+
+function buildDiagHtml(diag, sourceKey) {
+  const statusOk  = diag.http_status >= 200 && diag.http_status < 300;
+  const statusCls = diag.error ? "err" : (statusOk ? "ok" : "warn");
+  const found     = diag.elements_found ?? 0;
+
+  let html = `<div class="debug-grid">
+    <span class="debug-key">Source</span>
+    <span class="debug-val">${escHtml(diag.source || sourceKey)}</span>
+
+    <span class="debug-key">URL tried</span>
+    <span class="debug-val">${diag.url ? `<a href="${escHtml(diag.url)}" target="_blank" rel="noopener">${escHtml(diag.url)}</a>` : "N/A"}</span>
+
+    <span class="debug-key">HTTP Status</span>
+    <span class="debug-val ${statusCls}">${diag.http_status ?? "N/A (connection failed)"}</span>
+
+    <span class="debug-key">Response Size</span>
+    <span class="debug-val">${diag.response_size != null ? (diag.response_size / 1024).toFixed(1) + " KB" : "N/A"}</span>
+
+    <span class="debug-key">Results Parsed</span>
+    <span class="debug-val ${found > 0 ? "ok" : "warn"}">${found}</span>
+
+    <span class="debug-key">Error</span>
+    <span class="debug-val ${diag.error ? "err" : "ok"}">${diag.error ? escHtml(diag.error) : "None ✔"}</span>
+  </div>`;
+
+  // BidNet-specific attempt log
+  if (diag.attempts && diag.attempts.length) {
+    html += `<div class="debug-section-title">API Endpoint Attempts</div>
+      <div class="debug-attempts">`;
+    diag.attempts.forEach(a => {
+      const ok  = a.http_status >= 200 && a.http_status < 300;
+      const cls = a.error ? "err" : (ok ? "ok" : "warn");
+      html += `<div class="debug-attempt">
+        <div class="debug-attempt-url">${escHtml(a.url || "")}</div>
+        <div class="debug-attempt-status ${cls}">
+          Status: ${a.http_status ?? "Connection failed"} &nbsp;|&nbsp;
+          Size: ${a.response_size != null ? (a.response_size / 1024).toFixed(1) + " KB" : "N/A"} &nbsp;|&nbsp;
+          Type: ${escHtml(a.content_type || "N/A")}
+        </div>
+        ${a.error ? `<div class="debug-val err" style="margin-top:.3rem;font-size:.83rem">${escHtml(a.error)}</div>` : ""}
+      </div>`;
+    });
+    html += `</div>`;
+  }
+
+  // DuckDuckGo per-query details
+  if (diag.per_query && diag.per_query.length) {
+    html += `<div class="debug-section-title">Per-Query Details</div>
+      <div class="debug-attempts">`;
+    diag.per_query.forEach(q => {
+      html += `<div class="debug-attempt">
+        <div class="debug-attempt-url">Query: ${escHtml(q.query || "")}</div>
+        <div class="debug-attempt-status ${q.error ? "err" : "ok"}">
+          Status: ${q.http_status ?? "N/A"} &nbsp;|&nbsp;
+          Found: ${q.elements_found ?? 0} &nbsp;|&nbsp;
+          Selector: ${escHtml(q.selector_used || "none matched")}
+        </div>
+        ${q.error ? `<div class="debug-val err" style="margin-top:.3rem;font-size:.83rem">${escHtml(q.error)}</div>` : ""}
+      </div>`;
+    });
+    html += `</div>`;
+  }
+
+  // Raw response preview
+  if (diag.response_preview) {
+    html += `<div class="debug-section-title">Raw Response Preview (first ${DIAG_PREVIEW_CHARS} chars)</div>
+      <div class="debug-pre">${escHtml(diag.response_preview)}</div>`;
+  }
+
+  // Guidance
+  html += buildGuidance(diag, sourceKey);
+  return html;
+}
+
+function buildGuidance(diag, sourceKey) {
+  const error = (diag.error || "").toLowerCase();
+  let tip = "";
+
+  if (error.includes("connection failed") || error.includes("cannot reach")) {
+    tip = `<strong>Connection blocked:</strong> The server cannot reach ${escHtml(_sourceLabel(sourceKey))}. 
+           This usually means the domain is blocked by a firewall, proxy, or the host machine's network. 
+           Try running the app directly on your local machine (not in a sandboxed environment).`;
+  } else if (error.includes("angular shell") || error.includes("javascript")) {
+    tip = `<strong>JavaScript-rendered site:</strong> ${escHtml(_sourceLabel(sourceKey))} loads its results 
+           via JavaScript. The scrapers have tried several known API endpoint patterns — if all failed, 
+           the site may require authentication or has changed its API. 
+           Consider searching bidnetdirect.com directly and pasting the results, or contact BidNet for API access.`;
+  } else if (diag.http_status === 401 || diag.http_status === 403) {
+    tip = `<strong>Authentication required (HTTP ${diag.http_status}):</strong> 
+           This source requires an API key or login. Check the source's developer documentation 
+           for a free public API token.`;
+  } else if (diag.http_status === 429) {
+    tip = `<strong>Rate limited (HTTP 429):</strong> Too many requests. Wait a minute and try again, 
+           or reduce your search frequency.`;
+  } else if (diag.elements_found === 0 && !diag.error) {
+    tip = `<strong>No matching results:</strong> The source was reached successfully but returned 0 results 
+           for your keywords. Try broader keywords or different document types.`;
+  }
+
+  if (!tip) return "";
+  return `<div class="debug-section-title">Guidance</div>
+    <div class="source-errors" style="margin-top:0">
+      <p style="font-size:.88rem;color:var(--clr-text)">${tip}</p>
+    </div>`;
+}
+
+function closeDebugModal() {
+  document.getElementById("modal-debug").classList.add("hidden");
+}
+
+document.getElementById("btn-debug-close").addEventListener("click", closeDebugModal);
+document.getElementById("btn-debug-close2").addEventListener("click", closeDebugModal);
+document.getElementById("debug-backdrop").addEventListener("click", closeDebugModal);
+
 // ─── Utility ──────────────────────────────────────────────────────────────────
 function escHtml(str) {
   return String(str ?? "")
@@ -683,6 +861,15 @@ function escHtml(str) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+function _sourceLabel(key) {
+  const labels = {
+    sam_gov:    "SAM.gov (Federal)",
+    web_search: "Web Search (DuckDuckGo)",
+    bidnet:     "BidNet Direct",
+  };
+  return labels[key] || key;
 }
 
 // ─── Initialise ───────────────────────────────────────────────────────────────

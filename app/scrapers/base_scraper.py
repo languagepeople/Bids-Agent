@@ -3,7 +3,10 @@ Base scraper class defining the interface all scrapers must implement.
 """
 
 from abc import ABC, abstractmethod
-from typing import List, Dict
+from typing import List, Dict, Any
+
+# Number of characters of the raw HTTP response to include in diagnostics.
+DIAG_PREVIEW_CHARS = 600
 
 
 class BaseScraper(ABC):
@@ -32,3 +35,33 @@ class BaseScraper(ABC):
         List of dicts matching FIELDS above.
         """
         raise NotImplementedError
+
+    def diagnose(self, keywords: str, search_types: List[str]) -> Dict[str, Any]:
+        """
+        Return a diagnostic dict describing the outcome of an attempted search.
+        Subclasses should override this to provide richer information.
+
+        Minimum keys:
+          source, url, http_status, response_size, error, elements_found, response_preview
+        """
+        try:
+            results = self.search(keywords, search_types, max_results=5)
+            return {
+                "source": getattr(self, "SOURCE_NAME", type(self).__name__),
+                "url": None,
+                "http_status": None,
+                "response_size": None,
+                "error": None if results else "search() returned 0 results (no detailed diagnostics available)",
+                "elements_found": len(results),
+                "response_preview": None,
+            }
+        except Exception as exc:
+            return {
+                "source": getattr(self, "SOURCE_NAME", type(self).__name__),
+                "url": None,
+                "http_status": None,
+                "response_size": None,
+                "error": str(exc),
+                "elements_found": 0,
+                "response_preview": None,
+            }

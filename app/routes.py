@@ -4,7 +4,6 @@ Flask routes / REST API for the Bids Agent application.
 
 import json
 import os
-import threading
 from flask import Blueprint, request, jsonify, send_file, current_app
 
 from .database import (
@@ -49,6 +48,9 @@ def search():
         "sources": ["sam_gov", "web_search"],
         "max_results": 25
     }
+
+    Response includes a "source_errors" dict so the UI can surface
+    per-source failure messages even when total results > 0.
     """
     body = request.get_json(force=True) or {}
     keywords = (body.get("keywords") or "").strip()
@@ -62,21 +64,31 @@ def search():
     search_id = save_search(keywords, search_types, sources)
 
     all_results = []
+    source_errors: dict = {}   # key = source_key, value = error string
+
     for source_key in sources:
         scraper = SCRAPERS.get(source_key)
         if scraper is None:
+            source_errors[source_key] = "Unknown source key"
             continue
         try:
             results = scraper.search(keywords, search_types, max_results=max_results)
             all_results.extend(results)
+            if not results:
+                source_errors[source_key] = (
+                    "Search returned 0 results. "
+                    "Use the Diagnose button next to this source for details."
+                )
         except Exception as exc:
+            msg = str(exc)
+            source_errors[source_key] = msg
             current_app.logger.warning(
                 "Scraper %s failed for keywords=%r types=%r: %s",
                 source_key, keywords, search_types, exc,
             )
 
     # De-duplicate by source_url, keep first occurrence
-    seen_urls = set()
+    seen_urls: set = set()
     unique_results = []
     for r in all_results:
         url_key = r.get("source_url") or r.get("title") or ""
@@ -91,6 +103,7 @@ def search():
         "search_id": search_id,
         "count": len(saved),
         "results": saved,
+        "source_errors": source_errors,
     })
 
 
@@ -111,6 +124,46 @@ def get_search_results(search_id):
 @api.route("/results", methods=["GET"])
 def all_results():
     return jsonify(get_all_results())
+
+
+# ─── Diagnostics endpoint ─────────────────────────────────────────────────────
+
+@api.route("/debug/scraper", methods=["POST"])
+def debug_scraper():
+    """
+    POST /api/debug/scraper
+    Body: {
+        "source":       "bidnet",
+        "keywords":     "Translation",
+        "search_types": ["RFP"]
+    }
+
+    Returns detailed diagnostic information: HTTP status, response size,
+    number of parsed elements, error messages, and a snippet of the raw
+    response — so the user can see exactly why a scraper is returning 0 results.
+    """
+    body = request.get_json(force=True) or {}
+    source_key = (body.get("source") or "").strip()
+    keywords   = (body.get("keywords") or "Translation").strip()
+    search_types = body.get("search_types") or ["RFP", "RFQ", "RFI", "Bid"]
+
+    if not source_key:
+        return jsonify({"error": "source is required"}), 400
+
+    scraper = SCRAPERS.get(source_key)
+    if scraper is None:
+        return jsonify({"error": f"Unknown source '{source_key}'"}), 404
+
+    try:
+        diag = scraper.diagnose(keywords, search_types)
+    except Exception as exc:
+        diag = {
+            "source": source_key,
+            "error": f"diagnose() raised an unexpected exception: {exc}",
+            "elements_found": 0,
+        }
+
+    return jsonify(diag)
 
 
 # ─── Export endpoint ──────────────────────────────────────────────────────────

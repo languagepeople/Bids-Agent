@@ -8,9 +8,9 @@ no API key required).
 import re
 import requests
 from bs4 import BeautifulSoup
-from typing import List, Dict
+from typing import List, Dict, Any, Tuple
 from urllib.parse import urlparse
-from .base_scraper import BaseScraper
+from .base_scraper import BaseScraper, DIAG_PREVIEW_CHARS
 
 DDG_URL = "https://html.duckduckgo.com/html/"
 
@@ -31,6 +31,13 @@ TYPE_TERMS = {
     "Bid": "bid solicitation",
 }
 
+# Ordered list of CSS selector attempts (DDG sometimes changes their HTML structure)
+RESULT_SELECTORS = [
+    (".result__title a", ".result__snippet"),   # classic layout
+    (".result-title a",  ".result-snippet"),    # alternative class names
+    ("h2 a",             ".result__body"),      # simplified layout
+]
+
 
 class WebSearchScraper(BaseScraper):
     """Use DuckDuckGo HTML search to find bid opportunities."""
@@ -38,32 +45,74 @@ class WebSearchScraper(BaseScraper):
     SOURCE_NAME = "Web Search"
 
     def search(self, keywords: str, search_types: List[str], max_results: int = 25) -> List[Dict]:
-        results = []
-        # Run one search per selected type to maximize coverage
-        for stype in (search_types or ["RFP"]):
+        results, _diag = self._run_search(keywords, search_types, max_results)
+        return results
+
+    def diagnose(self, keywords: str, search_types: List[str]) -> Dict[str, Any]:
+        _results, diag = self._run_search(keywords, search_types, max_results=5)
+        return diag
+
+    def _run_search(self, keywords: str, search_types: List[str], max_results: int = 25
+                    ) -> Tuple[List[Dict], Dict[str, Any]]:
+        query_types = search_types or ["RFP"]
+        per_type = max(max_results // len(query_types), 5)
+        all_results = []
+        all_diags: List[Dict] = []
+
+        for stype in query_types:
             extra = TYPE_TERMS.get(stype, stype)
             query = f"{keywords} {extra} procurement government"
-            per_type = max(max_results // len(search_types), 5) if search_types else max_results
-            batch = self._ddg_search(query, max_results=per_type)
-            # Tag each result with its search type
+            batch, diag = self._ddg_search(query, max_results=per_type)
             for r in batch:
                 r["raw_data"]["search_type"] = stype
-            results.extend(batch)
-            if len(results) >= max_results:
+            all_results.extend(batch)
+            all_diags.append(diag)
+            if len(all_results) >= max_results:
                 break
 
         # De-duplicate by URL
-        seen_urls = set()
+        seen_urls: set = set()
         unique = []
-        for r in results:
+        for r in all_results:
             url = r.get("source_url") or ""
             if url not in seen_urls:
                 seen_urls.add(url)
                 unique.append(r)
 
-        return unique[:max_results]
+        # Aggregate diagnostics — surface the first error found
+        combined_diag: Dict[str, Any] = {
+            "source": self.SOURCE_NAME,
+            "url": DDG_URL,
+            "http_status": None,
+            "response_size": None,
+            "error": None,
+            "elements_found": len(unique),
+            "response_preview": None,
+            "per_query": all_diags,
+        }
+        for d in all_diags:
+            if d.get("error"):
+                combined_diag["error"] = d["error"]
+                combined_diag["http_status"] = d.get("http_status")
+                break
+        if all_diags:
+            combined_diag["http_status"] = all_diags[0].get("http_status")
+            combined_diag["response_size"] = all_diags[0].get("response_size")
+            combined_diag["response_preview"] = all_diags[0].get("response_preview")
 
-    def _ddg_search(self, query: str, max_results: int = 10) -> List[Dict]:
+        return unique[:max_results], combined_diag
+
+    def _ddg_search(self, query: str, max_results: int = 10) -> Tuple[List[Dict], Dict[str, Any]]:
+        diag: Dict[str, Any] = {
+            "query": query,
+            "http_status": None,
+            "response_size": None,
+            "error": None,
+            "elements_found": 0,
+            "selector_used": None,
+            "response_preview": None,
+        }
+
         try:
             resp = requests.post(
                 DDG_URL,
@@ -72,28 +121,55 @@ class WebSearchScraper(BaseScraper):
                 timeout=15,
                 allow_redirects=True,
             )
+            diag["http_status"] = resp.status_code
+            diag["response_size"] = len(resp.content)
+            diag["response_preview"] = resp.text[:DIAG_PREVIEW_CHARS]
             resp.raise_for_status()
-        except requests.RequestException:
-            return []
+        except requests.exceptions.ConnectionError as exc:
+            diag["error"] = f"Connection failed — cannot reach html.duckduckgo.com: {exc}"
+            return [], diag
+        except requests.exceptions.Timeout:
+            diag["error"] = "Request timed out after 15 s"
+            return [], diag
+        except requests.exceptions.HTTPError as exc:
+            diag["error"] = f"HTTP {resp.status_code}: {resp.text[:200]}"
+            return [], diag
+        except requests.RequestException as exc:
+            diag["error"] = str(exc)
+            return [], diag
 
         soup = BeautifulSoup(resp.text, "lxml")
-        results = []
 
-        for result_div in soup.select(".result")[:max_results]:
+        # Try each selector pair until one matches
+        title_sel, snippet_sel = RESULT_SELECTORS[0]
+        for ts, ss in RESULT_SELECTORS:
+            if soup.select(ts):
+                title_sel, snippet_sel = ts, ss
+                diag["selector_used"] = ts
+                break
+        else:
+            # No selector matched — report the HTML tag summary for debugging
+            tags = [t.name for t in soup.find_all(True, limit=30)]
+            diag["error"] = (
+                f"No result elements found on DuckDuckGo page. "
+                f"HTML tags present: {', '.join(dict.fromkeys(tags))}. "
+                f"The page structure may have changed or the request was blocked."
+            )
+            return [], diag
+
+        results = []
+        for result_div in soup.select(".result, .web-result")[:max_results]:
             r = self.empty_result()
 
-            # Title + URL
-            title_tag = result_div.select_one(".result__title a")
+            title_tag = result_div.select_one(title_sel)
             if title_tag:
                 r["title"] = title_tag.get_text(strip=True)
                 href = title_tag.get("href", "")
-                # DuckDuckGo wraps URLs; extract the real URL
                 real_url = _extract_url(href)
                 r["source_url"] = real_url
                 r["site"] = _domain(real_url)
 
-            # Snippet / description
-            snippet_tag = result_div.select_one(".result__snippet")
+            snippet_tag = result_div.select_one(snippet_sel)
             if snippet_tag:
                 r["description"] = snippet_tag.get_text(strip=True)[:300]
 
@@ -103,14 +179,20 @@ class WebSearchScraper(BaseScraper):
             if r["title"]:
                 results.append(r)
 
-        return results
+        diag["elements_found"] = len(results)
+        if not results and not diag.get("error"):
+            diag["error"] = (
+                f"Selector '{title_sel}' matched the page but extracted 0 titled results. "
+                "DuckDuckGo may have returned a CAPTCHA or empty page."
+            )
+
+        return results, diag
 
 
 def _extract_url(href: str) -> str:
     """DuckDuckGo sometimes wraps links in redirect URLs."""
     if not href:
         return ""
-    # Real redirect: //duckduckgo.com/l/?uddg=<encoded_url>
     match = re.search(r"uddg=([^&]+)", href)
     if match:
         from urllib.parse import unquote
