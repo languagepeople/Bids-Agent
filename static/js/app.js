@@ -905,6 +905,13 @@ function buildGuidance(diag, sourceKey) {
   } else if (pwError.includes("chromium") && pwError.includes("missing")) {
     tip = `<strong>Chromium binary missing:</strong> Playwright is installed but the browser binary wasn't downloaded.
            Run: <code>playwright install chromium</code> and restart the app.`;
+  } else if (pwError.includes("timeout") || pwError.includes("exceeded")) {
+    tip = `<strong>Playwright timed out waiting for BidNet to render.</strong>
+           This is usually caused by a slow network connection. The scraper now uses 
+           <code>domcontentloaded</code> instead of <code>networkidle</code> so background 
+           XHR polls no longer block it — make sure you have the latest code 
+           (<code>git pull</code>). If the timeout persists, check that your internet 
+           connection can reach <a href="https://www.bidnetdirect.com" target="_blank" rel="noopener">bidnetdirect.com</a>.`;
   } else if (error.includes("connection failed") || error.includes("cannot reach")) {
     tip = `<strong>Connection blocked:</strong> The server cannot reach ${escHtml(_sourceLabel(sourceKey))}. 
            This usually means the domain is blocked by a firewall or proxy. 

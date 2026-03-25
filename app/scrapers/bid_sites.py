@@ -316,6 +316,14 @@ class BidNetScraper(BaseScraper):
         Use Playwright headless Chromium to navigate BidNet, execute its
         JavaScript, and extract the rendered solicitation list.
 
+        Strategy:
+        1. Navigate with wait_until="domcontentloaded" (fast; does NOT wait for
+           ongoing XHR polls — BidNet AngularJS sends background heartbeats that
+           prevent "networkidle" from ever firing within a reasonable timeout).
+        2. Wait for AngularJS to bootstrap (window.angular becomes defined).
+        3. Poll wait_for_selector for each known row selector up to 10 s.
+        4. Extract data via page.evaluate() JavaScript.
+
         Install once:
             pip install playwright
             playwright install chromium
@@ -340,6 +348,7 @@ class BidNetScraper(BaseScraper):
             diag["error"] = PLAYWRIGHT_NOT_INSTALLED
             return [], diag
 
+        # BidNet search URL — AngularJS reads the `keywords` query param on init
         search_url = f"{self.BASE_URL}/public/solicitations?keywords={quote(keywords)}"
         diag["url"] = search_url
 
@@ -353,19 +362,34 @@ class BidNetScraper(BaseScraper):
                 )
                 page = ctx.new_page()
 
-                # Navigate and wait for network activity to settle so Angular
-                # has time to fetch and render the solicitation list
-                response = page.goto(search_url, wait_until="networkidle", timeout=20_000)
+                # ── Step 1: Navigate — use "domcontentloaded" not "networkidle" ──
+                # BidNet AngularJS sends continuous background XHR polls (analytics,
+                # session keepalive, etc.).  "networkidle" waits for 500 ms of no
+                # network activity — that never happens on this site, so we time out.
+                # "domcontentloaded" fires as soon as the HTML is parsed, which is all
+                # we need before waiting for Angular to bootstrap below.
+                response = page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
                 if response:
                     diag["http_status"] = response.status
 
-                # Try to find the solicitation list container.
-                # Per-selector timeout is short (1.5 s) because the DOM is already fully
-                # rendered after networkidle — elements are either present or they aren't.
+                # ── Step 2: Wait for AngularJS to bootstrap ────────────────────
+                # Angular attaches itself to window.angular after its scripts load.
+                # 12 s gives enough headroom for slow networks while staying well
+                # under the 30 s navigation timeout; if it doesn't appear we still
+                # attempt selector polling (non-fatal).
+                try:
+                    page.wait_for_function("() => !!window.angular", timeout=12_000)
+                except PWTimeout:
+                    pass  # Non-Angular or very slow; continue anyway
+
+                # ── Step 3: Poll for rendered solicitation rows ────────────────
+                # After Angular bootstraps it fires an $http request to the BidNet
+                # API and ng-repeats the results into the DOM.  We wait up to 10 s
+                # per selector so the digest cycle has time to complete.
                 found_sel: Optional[str] = None
                 for sel in BIDNET_ROW_SELECTORS:
                     try:
-                        page.wait_for_selector(sel, timeout=1_500)
+                        page.wait_for_selector(sel, timeout=10_000)
                         found_sel = sel
                         break
                     except PWTimeout:
@@ -376,7 +400,7 @@ class BidNetScraper(BaseScraper):
                 diag["response_preview"] = page_html[:DIAG_PREVIEW_CHARS]
 
                 if not found_sel:
-                    # Try a broader BeautifulSoup parse as last-ditch
+                    # Last-ditch: parse whatever HTML Angular rendered
                     results = self._parse_html(page_html, search_url, max_results)
                     if results:
                         diag["elements_found"] = len(results)
@@ -394,7 +418,7 @@ class BidNetScraper(BaseScraper):
 
                 diag["selector_used"] = found_sel
 
-                # Extract structured data from the rendered DOM via JavaScript
+                # ── Step 4: Extract structured data via JavaScript ─────────────
                 rows_data: List[Dict] = page.evaluate(
                     """(sel) => {
                         const rows = Array.from(document.querySelectorAll(sel));
@@ -403,7 +427,6 @@ class BidNetScraper(BaseScraper):
                             const cells = Array.from(row.querySelectorAll('td'));
                             const firstLink = links[0] || null;
                             const getText = el => el ? el.textContent.replace(/\\s+/g, ' ').trim() : '';
-                            // Look for common field labels
                             const findField = (labels) => {
                                 for (const label of labels) {
                                     const el = row.querySelector(
