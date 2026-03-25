@@ -6,6 +6,7 @@ no API key required).
 """
 
 import re
+import time
 import requests
 from bs4 import BeautifulSoup
 from typing import List, Dict, Any, Tuple
@@ -14,13 +15,16 @@ from .base_scraper import BaseScraper, DIAG_PREVIEW_CHARS
 
 DDG_URL = "https://html.duckduckgo.com/html/"
 
+# Full browser-like headers — missing Accept causes DDG to return a non-HTML response
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
     ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
+    "Content-Type": "application/x-www-form-urlencoded",
 }
 
 # Extra context terms appended to the user query
@@ -31,12 +35,18 @@ TYPE_TERMS = {
     "Bid": "bid solicitation",
 }
 
-# Ordered list of CSS selector attempts (DDG sometimes changes their HTML structure)
+# Ordered list of CSS selectors to try (DDG updates their HTML structure periodically)
 RESULT_SELECTORS = [
-    (".result__title a", ".result__snippet"),   # classic layout
-    (".result-title a",  ".result-snippet"),    # alternative class names
+    (".result__title a", ".result__snippet"),   # classic DDG layout
+    (".result-title a",  ".result-snippet"),    # alternative names
     ("h2 a",             ".result__body"),      # simplified layout
+    ("a.result__a",      ".result__snippet"),   # another variant
 ]
+
+# Seconds to wait between sequential DDG queries to reduce rate-limit risk
+DDG_QUERY_DELAY = 1.0
+# Max document types to query per search session (caps the number of DDG requests)
+MAX_QUERY_TYPES_PER_SEARCH = 2
 
 
 class WebSearchScraper(BaseScraper):
@@ -55,11 +65,17 @@ class WebSearchScraper(BaseScraper):
     def _run_search(self, keywords: str, search_types: List[str], max_results: int = 25
                     ) -> Tuple[List[Dict], Dict[str, Any]]:
         query_types = search_types or ["RFP"]
+        # Cap at MAX_QUERY_TYPES_PER_SEARCH queries per search to reduce rate-limit risk
+        query_types = query_types[:MAX_QUERY_TYPES_PER_SEARCH]
         per_type = max(max_results // len(query_types), 5)
         all_results = []
         all_diags: List[Dict] = []
 
-        for stype in query_types:
+        for i, stype in enumerate(query_types):
+            # Brief pause between queries to be polite and avoid bot detection
+            if i > 0:
+                time.sleep(DDG_QUERY_DELAY)
+
             extra = TYPE_TERMS.get(stype, stype)
             query = f"{keywords} {extra} procurement government"
             batch, diag = self._ddg_search(query, max_results=per_type)
@@ -114,7 +130,9 @@ class WebSearchScraper(BaseScraper):
         }
 
         try:
-            resp = requests.post(
+            # Use a session so DDG cookies are maintained across redirects
+            session = requests.Session()
+            resp = session.post(
                 DDG_URL,
                 data={"q": query, "kl": "us-en"},
                 headers=HEADERS,
@@ -153,7 +171,7 @@ class WebSearchScraper(BaseScraper):
             diag["error"] = (
                 f"No result elements found on DuckDuckGo page. "
                 f"HTML tags present: {', '.join(dict.fromkeys(tags))}. "
-                f"The page structure may have changed or the request was blocked."
+                f"The page structure may have changed or the request was blocked/rate-limited."
             )
             return [], diag
 
@@ -183,7 +201,8 @@ class WebSearchScraper(BaseScraper):
         if not results and not diag.get("error"):
             diag["error"] = (
                 f"Selector '{title_sel}' matched the page but extracted 0 titled results. "
-                "DuckDuckGo may have returned a CAPTCHA or empty page."
+                "DuckDuckGo may have returned a CAPTCHA or rate-limit page. "
+                "Try waiting 30 seconds and searching again."
             )
 
         return results, diag

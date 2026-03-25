@@ -759,21 +759,34 @@ function buildDiagHtml(diag, sourceKey) {
     <span class="debug-val">${diag.response_size != null ? (diag.response_size / 1024).toFixed(1) + " KB" : "N/A"}</span>
 
     <span class="debug-key">Results Parsed</span>
-    <span class="debug-val ${found > 0 ? "ok" : "warn"}">${found}</span>
+    <span class="debug-val ${found > 0 ? "ok" : "warn"}">${found}</span>`;
 
+  // SAM.gov: show whether an API key is configured
+  if (diag.api_key_set !== undefined) {
+    html += `
+    <span class="debug-key">API Key Set</span>
+    <span class="debug-val ${diag.api_key_set ? "ok" : "warn"}">${
+      diag.api_key_set ? "Yes ✔" : "No — set SAM_GOV_API_KEY env var for higher rate limits"
+    }</span>`;
+  }
+
+  html += `
     <span class="debug-key">Error</span>
     <span class="debug-val ${diag.error ? "err" : "ok"}">${diag.error ? escHtml(diag.error) : "None ✔"}</span>
   </div>`;
 
-  // BidNet-specific attempt log
+  // BidNet-specific: direct API attempt log
   if (diag.attempts && diag.attempts.length) {
-    html += `<div class="debug-section-title">API Endpoint Attempts</div>
+    html += `<div class="debug-section-title">Direct API Endpoint Attempts</div>
       <div class="debug-attempts">`;
     diag.attempts.forEach(a => {
       const ok  = a.http_status >= 200 && a.http_status < 300;
       const cls = a.error ? "err" : (ok ? "ok" : "warn");
       html += `<div class="debug-attempt">
-        <div class="debug-attempt-url">${escHtml(a.url || "")}</div>
+        <div class="debug-attempt-url">${escHtml(a.url || "")}${
+          ["GET","POST","PUT","PATCH","DELETE"].includes(a.method)
+            ? ` [${escHtml(a.method)}]` : ""
+        }</div>
         <div class="debug-attempt-status ${cls}">
           Status: ${a.http_status ?? "Connection failed"} &nbsp;|&nbsp;
           Size: ${a.response_size != null ? (a.response_size / 1024).toFixed(1) + " KB" : "N/A"} &nbsp;|&nbsp;
@@ -783,6 +796,21 @@ function buildDiagHtml(diag, sourceKey) {
       </div>`;
     });
     html += `</div>`;
+  }
+
+  // BidNet-specific: DuckDuckGo fallback result
+  if (diag.duckduckgo_fallback) {
+    const fb = diag.duckduckgo_fallback;
+    const fbCls = fb.error ? "err" : (fb.elements_found > 0 ? "ok" : "warn");
+    html += `<div class="debug-section-title">DuckDuckGo site:bidnetdirect.com Fallback</div>
+      <div class="debug-attempt">
+        <div class="debug-attempt-url">${escHtml(fb.query || "")}</div>
+        <div class="debug-attempt-status ${fbCls}">
+          Status: ${fb.http_status ?? "N/A"} &nbsp;|&nbsp;
+          Found: ${fb.elements_found ?? 0} results
+        </div>
+        ${fb.error ? `<div class="debug-val err" style="margin-top:.3rem;font-size:.83rem">${escHtml(fb.error)}</div>` : ""}
+      </div>`;
   }
 
   // DuckDuckGo per-query details
@@ -822,21 +850,28 @@ function buildGuidance(diag, sourceKey) {
     tip = `<strong>Connection blocked:</strong> The server cannot reach ${escHtml(_sourceLabel(sourceKey))}. 
            This usually means the domain is blocked by a firewall, proxy, or the host machine's network. 
            Try running the app directly on your local machine (not in a sandboxed environment).`;
+  } else if (error.includes("rate limit") || (diag.http_status === 429)) {
+    tip = `<strong>Rate limited (HTTP 429):</strong> Too many requests were sent. Wait 1–2 minutes and try again.
+           For SAM.gov, set the <code>SAM_GOV_API_KEY</code> environment variable — 
+           get a free key at <a href="https://sam.gov/profile/details" target="_blank" rel="noopener">sam.gov/profile/details</a>.`;
+  } else if (error.includes("api key") || error.includes("free tier") ||
+             diag.http_status === 401 || diag.http_status === 403) {
+    tip = `<strong>API key required (HTTP ${diag.http_status ?? "403"}):</strong>
+           Set the <code>SAM_GOV_API_KEY</code> environment variable with a free key from 
+           <a href="https://sam.gov/profile/details" target="_blank" rel="noopener">sam.gov/profile/details</a>.
+           Then restart the app. The free tier without a key allows only ~10 requests/day.`;
+  } else if (error.includes("415") || error.includes("cdn") || error.includes("waf")) {
+    tip = `<strong>CDN/bot-protection block (HTTP 415):</strong> BidNet's server rejected the request.
+           The DuckDuckGo <code>site:bidnetdirect.com</code> fallback was tried automatically —
+           if it also failed, try searching bidnetdirect.com directly in your browser and 
+           export the results manually.`;
   } else if (error.includes("angular shell") || error.includes("javascript")) {
     tip = `<strong>JavaScript-rendered site:</strong> ${escHtml(_sourceLabel(sourceKey))} loads its results 
-           via JavaScript. The scrapers have tried several known API endpoint patterns — if all failed, 
-           the site may require authentication or has changed its API. 
-           Consider searching bidnetdirect.com directly and pasting the results, or contact BidNet for API access.`;
-  } else if (diag.http_status === 401 || diag.http_status === 403) {
-    tip = `<strong>Authentication required (HTTP ${diag.http_status}):</strong> 
-           This source requires an API key or login. Check the source's developer documentation 
-           for a free public API token.`;
-  } else if (diag.http_status === 429) {
-    tip = `<strong>Rate limited (HTTP 429):</strong> Too many requests. Wait a minute and try again, 
-           or reduce your search frequency.`;
+           via JavaScript. Direct API access failed. The DuckDuckGo <code>site:bidnetdirect.com</code> 
+           fallback should still return indexed BidNet solicitations.`;
   } else if (diag.elements_found === 0 && !diag.error) {
     tip = `<strong>No matching results:</strong> The source was reached successfully but returned 0 results 
-           for your keywords. Try broader keywords or different document types.`;
+           for your keywords. Try a single keyword (e.g. <em>Translation</em>) instead of all keywords at once.`;
   }
 
   if (!tip) return "";

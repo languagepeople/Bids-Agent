@@ -4,35 +4,53 @@ Scrapers for public-sector bid aggregator websites.
 BidNet Direct
 -------------
 BidNet Direct renders its search results via AngularJS (client-side JavaScript).
-A plain GET request returns only the Angular application shell — the actual
-solicitation data is loaded through their JSON REST API.
+A plain GET request to their HTML route returns only the Angular application
+shell — the actual solicitation data is fetched by JavaScript at runtime.
 
-This scraper calls BidNet Direct's public REST API directly, bypassing the
-JavaScript rendering step.  It tries several known API URL patterns in order
-and uses whichever one succeeds.
+Strategy (tried in order):
+1. Several known JSON REST API patterns (all returned 404 in testing).
+2. The public HTML search page via GET and POST (returns 415 from their CDN).
+3. DuckDuckGo `site:bidnetdirect.com` search — BidNet pages are publicly
+   indexed, so this reliably returns real solicitations without needing
+   direct API access.  Results link directly to the BidNet solicitation pages.
 """
 
 import re
+import time
 import requests
 from bs4 import BeautifulSoup
 from typing import List, Dict, Any, Tuple
 from urllib.parse import urljoin, urlparse, quote
 from .base_scraper import BaseScraper, DIAG_PREVIEW_CHARS
+# web_search symbols used by the DuckDuckGo site-search fallback
+from .web_search import DDG_URL, RESULT_SELECTORS, _extract_url, _domain as _ddg_domain, HEADERS as DDG_HEADERS
 
 # Minimum HTML size (bytes) that suggests a real page vs an Angular app shell.
 # Angular shells are tiny stub files (< ~2 KB) before JS hydration.
 ANGULAR_SHELL_MAX_SIZE = 2000
 
-HEADERS = {
+# Browser-like headers for HTML page requests
+BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json, text/html, */*",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.bidnetdirect.com/",
 }
+
+# JSON-specific headers for API requests
+API_HEADERS = {
+    "User-Agent": BROWSER_HEADERS["User-Agent"],
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.bidnetdirect.com/",
+}
+
+# Keep HEADERS alias for GenericBidScraper compatibility
+HEADERS = BROWSER_HEADERS
 
 
 # ─── BidNet Direct ───────────────────────────────────────────────────────────
@@ -41,16 +59,17 @@ class BidNetScraper(BaseScraper):
     SOURCE_NAME = "BidNet Direct"
     BASE_URL = "https://www.bidnetdirect.com"
 
-    # Candidate API endpoints tried in order; first one that returns results wins.
-    # BidNet uses an AngularJS SPA — actual data comes from these JSON endpoints.
+    # Candidate JSON API endpoints tried in order.
+    # BidNet uses an AngularJS SPA — actual data comes from internal JSON endpoints.
     CANDIDATE_APIS = [
-        # Primary public search API (most common pattern for Angular SPA backends)
         "https://www.bidnetdirect.com/api/v1/public/solicitations/search",
         "https://www.bidnetdirect.com/api/v1/publicSolicitations",
         "https://www.bidnetdirect.com/api/public/opportunities/search",
-        # Fallback: their HTML search page (works if they ever add SSR)
-        "https://www.bidnetdirect.com/public/solicitations/search",
+        "https://www.bidnetdirect.com/api/v2/public/solicitations/search",
     ]
+
+    # HTML search page — tried last; returns 415 when CDN rejects bot UA
+    HTML_SEARCH_URL = "https://www.bidnetdirect.com/public/solicitations/search"
 
     def search(self, keywords: str, search_types: List[str], max_results: int = 25) -> List[Dict]:
         results, _diag = self._fetch(keywords, search_types, max_results)
@@ -73,13 +92,15 @@ class BidNetScraper(BaseScraper):
             "attempts": [],
         }
 
+        # ── Step 1: try JSON API endpoints ────────────────────────────────────
         for api_url in self.CANDIDATE_APIS:
             attempt: Dict[str, Any] = {"url": api_url}
             try:
                 resp = requests.get(
                     api_url,
-                    params=self._build_params(api_url, keywords, max_results),
-                    headers=HEADERS,
+                    params={"q": keywords, "keywords": keywords,
+                            "page": 1, "pageSize": max_results},
+                    headers=API_HEADERS,
                     timeout=15,
                 )
                 attempt["http_status"] = resp.status_code
@@ -87,7 +108,6 @@ class BidNetScraper(BaseScraper):
                 attempt["content_type"] = resp.headers.get("Content-Type", "")
                 attempt["response_preview"] = resp.text[:DIAG_PREVIEW_CHARS]
 
-                # Check if the response is the Angular shell (empty SPA)
                 if _is_angular_shell(resp.text, resp.headers.get("Content-Type", "")):
                     attempt["error"] = (
                         "Received the Angular app shell — this URL loads results via "
@@ -102,8 +122,6 @@ class BidNetScraper(BaseScraper):
                     continue
 
                 resp.raise_for_status()
-
-                # Try to parse as JSON first, then fall back to HTML
                 ct = resp.headers.get("Content-Type", "")
                 if "json" in ct:
                     results = self._parse_json(resp.json(), max_results)
@@ -116,11 +134,10 @@ class BidNetScraper(BaseScraper):
                         diag["attempts"].append(attempt)
                         return results, diag
                     attempt["error"] = (
-                        f"JSON response parsed successfully but contained 0 solicitations. "
+                        "JSON response contained 0 solicitations. "
                         f"Keys: {list(resp.json().keys()) if isinstance(resp.json(), dict) else 'list'}"
                     )
                 else:
-                    # HTML response — try to parse solicitation rows
                     results = self._parse_html(resp.text, api_url, max_results)
                     if results:
                         diag["url"] = api_url
@@ -146,23 +163,184 @@ class BidNetScraper(BaseScraper):
 
             diag["attempts"].append(attempt)
 
-        # All attempts exhausted
-        errors = "; ".join(
+        # ── Step 2: try HTML search page (GET then POST) ──────────────────────
+        for method, extra_kw in [("GET", {}), ("POST", {"data": {"q": keywords}})]:
+            attempt = {"url": self.HTML_SEARCH_URL, "method": method}
+            try:
+                req_kwargs: Dict[str, Any] = {
+                    "headers": BROWSER_HEADERS,
+                    "timeout": 15,
+                    **extra_kw,
+                }
+                if method == "GET":
+                    req_kwargs["params"] = {"q": keywords}
+                    resp = requests.get(self.HTML_SEARCH_URL, **req_kwargs)
+                else:
+                    resp = requests.post(self.HTML_SEARCH_URL, **req_kwargs)
+
+                attempt["http_status"] = resp.status_code
+                attempt["response_size"] = len(resp.content)
+                attempt["content_type"] = resp.headers.get("Content-Type", "")
+                attempt["response_preview"] = resp.text[:DIAG_PREVIEW_CHARS]
+
+                if resp.status_code == 415:
+                    attempt["error"] = (
+                        f"HTTP 415 — server rejected the {method} request (CDN/WAF bot protection). "
+                        "BidNet requires a real browser session with cookies and JS execution."
+                    )
+                    diag["attempts"].append(attempt)
+                    continue
+
+                if resp.status_code == 404:
+                    attempt["error"] = "404 Not Found"
+                    diag["attempts"].append(attempt)
+                    continue
+
+                if _is_angular_shell(resp.text, resp.headers.get("Content-Type", "")):
+                    attempt["error"] = "Received Angular app shell — results rendered by JavaScript"
+                    diag["attempts"].append(attempt)
+                    continue
+
+                resp.raise_for_status()
+                results = self._parse_html(resp.text, self.HTML_SEARCH_URL, max_results)
+                if results:
+                    diag["url"] = self.HTML_SEARCH_URL
+                    diag["http_status"] = resp.status_code
+                    diag["response_size"] = len(resp.content)
+                    diag["elements_found"] = len(results)
+                    diag["response_preview"] = resp.text[:DIAG_PREVIEW_CHARS]
+                    diag["attempts"].append(attempt)
+                    return results, diag
+                attempt["error"] = "HTML page returned but 0 solicitation rows matched"
+
+            except requests.exceptions.HTTPError as exc:
+                attempt["error"] = f"HTTP error: {exc}"
+            except requests.RequestException as exc:
+                attempt["error"] = str(exc)
+            except Exception as exc:
+                attempt["error"] = f"Unexpected error: {exc}"
+
+            diag["attempts"].append(attempt)
+
+        # ── Step 3: DuckDuckGo site:bidnetdirect.com fallback ─────────────────
+        fallback_results, fallback_diag = self._duckduckgo_site_search(
+            keywords, search_types, max_results
+        )
+        diag["duckduckgo_fallback"] = fallback_diag
+
+        if fallback_results:
+            diag["url"] = "DuckDuckGo site:bidnetdirect.com (fallback)"
+            diag["elements_found"] = len(fallback_results)
+            diag["error"] = None
+            return fallback_results, diag
+
+        # All methods exhausted
+        api_errors = "; ".join(
             f"[{a['url'].split('/')[-1]}] {a.get('error', 'unknown')}"
             for a in diag["attempts"]
         )
         diag["error"] = (
-            "All BidNet Direct API endpoint attempts failed. "
-            "BidNet Direct loads solicitations via JavaScript — see details below. "
-            f"Attempts: {errors}"
+            "All BidNet Direct scraping methods failed. "
+            f"Direct API attempts: {api_errors}. "
+            f"DuckDuckGo fallback: {fallback_diag.get('error', 'returned 0 results')}."
         )
         return [], diag
 
-    @staticmethod
-    def _build_params(url: str, keywords: str, max_results: int) -> Dict:
-        """Build query parameters appropriate for the endpoint URL."""
-        base = {"q": keywords, "keywords": keywords, "page": 1, "pageSize": max_results}
-        return base
+    def _duckduckgo_site_search(self, keywords: str, search_types: List[str],
+                                 max_results: int) -> Tuple[List[Dict], Dict[str, Any]]:
+        """
+        Search DuckDuckGo for `site:bidnetdirect.com <keywords>`.
+        BidNet solicitation pages are publicly indexed, so this returns real results
+        when BidNet's own API is inaccessible.
+        """
+        query = f"site:bidnetdirect.com {keywords} solicitation"
+        diag: Dict[str, Any] = {
+            "query": query,
+            "method": "DuckDuckGo site:bidnetdirect.com",
+            "http_status": None,
+            "response_size": None,
+            "error": None,
+            "elements_found": 0,
+            "response_preview": None,
+        }
+
+        try:
+            session = requests.Session()
+            resp = session.post(
+                DDG_URL,
+                data={"q": query, "kl": "us-en"},
+                headers=DDG_HEADERS,
+                timeout=15,
+                allow_redirects=True,
+            )
+            diag["http_status"] = resp.status_code
+            diag["response_size"] = len(resp.content)
+            diag["response_preview"] = resp.text[:DIAG_PREVIEW_CHARS]
+            resp.raise_for_status()
+        except requests.exceptions.ConnectionError as exc:
+            diag["error"] = f"Connection failed: {exc}"
+            return [], diag
+        except requests.exceptions.HTTPError as exc:
+            diag["error"] = f"HTTP {resp.status_code}: {resp.text[:100]}"
+            return [], diag
+        except requests.RequestException as exc:
+            diag["error"] = str(exc)
+            return [], diag
+
+        soup = BeautifulSoup(resp.text, "lxml")
+
+        # Find matching selector
+        title_sel = RESULT_SELECTORS[0][0]
+        snippet_sel = RESULT_SELECTORS[0][1]
+        for ts, ss in RESULT_SELECTORS:
+            if soup.select(ts):
+                title_sel, snippet_sel = ts, ss
+                break
+
+        results = []
+        for result_div in soup.select(".result, .web-result")[:max_results]:
+            r = self.empty_result()
+
+            title_tag = result_div.select_one(title_sel)
+            if not title_tag:
+                continue
+
+            r["title"] = title_tag.get_text(strip=True)
+            href = title_tag.get("href", "")
+            real_url = _extract_url(href)
+            r["source_url"] = real_url
+            r["site"] = self.BASE_URL
+            r["source_name"] = self.SOURCE_NAME
+
+            snippet_tag = result_div.select_one(snippet_sel)
+            if snippet_tag:
+                r["description"] = snippet_tag.get_text(strip=True)[:300]
+
+            r["raw_data"] = {"query": query, "method": "duckduckgo_site_search"}
+
+            # Only keep results that point to BidNet (check the parsed hostname,
+            # not a substring, to avoid matching URLs like evil.com/bidnetdirect.com)
+            try:
+                hostname = urlparse(real_url).netloc.lower()
+            except Exception:
+                hostname = ""
+            if r["title"] and (hostname == "www.bidnetdirect.com" or
+                                hostname == "bidnetdirect.com"):
+                results.append(r)
+
+        diag["elements_found"] = len(results)
+        if not results and not diag.get("error"):
+            if not soup.select(title_sel):
+                diag["error"] = (
+                    "DuckDuckGo returned no results — the page may have no matching entries "
+                    "or DuckDuckGo rate-limited the request."
+                )
+            else:
+                diag["error"] = (
+                    "DuckDuckGo returned results but none pointed to bidnetdirect.com. "
+                    "BidNet pages may not be indexed for these keywords."
+                )
+        return results, diag
 
     @staticmethod
     def _parse_json(data: Any, max_results: int) -> List[Dict]:
@@ -203,7 +381,6 @@ class BidNetScraper(BaseScraper):
         soup = BeautifulSoup(html, "lxml")
         results = []
 
-        # Try multiple common row selectors used by bid platforms
         row_selectors = [
             "div.solicitation-item",
             "tr.solicitation-row",
@@ -263,7 +440,6 @@ class GenericBidScraper(BaseScraper):
 
     SOURCE_NAME = "Generic"
 
-    # Sites known to list public bids/RFPs
     TARGET_SITES = [
         ("https://www.publicpurchase.com/gems/register/register&action=contract&contractId=",
          "PublicPurchase"),
@@ -278,7 +454,7 @@ class GenericBidScraper(BaseScraper):
                 break
             try:
                 url = url_template + requests.utils.quote(keywords)
-                resp = requests.get(url, headers=HEADERS, timeout=15)
+                resp = requests.get(url, headers=BROWSER_HEADERS, timeout=15)
                 resp.raise_for_status()
                 parsed = self._parse_table(resp.text, source_name, resp.url)
                 results.extend(parsed[: max_results - len(results)])
@@ -299,7 +475,6 @@ class GenericBidScraper(BaseScraper):
             r["source_name"] = source_name
             r["site"] = _domain(base_url)
 
-            # Best-effort heuristic: first cell with a link = title+URL
             link = row.find("a")
             if link:
                 r["title"] = link.get_text(strip=True)
@@ -323,12 +498,10 @@ def _is_angular_shell(html: str, content_type: str) -> bool:
     """Return True if the response is an empty JavaScript SPA shell."""
     if "json" in content_type:
         return False
-    # Angular / React shells are tiny HTML files with app-root or ng-app
     indicators = ["ng-app", "ng-version", "<app-root", "app-root></app-root",
                   "data-ng-app", "angularjs"]
     lower = html.lower()
     has_angular = any(ind in lower for ind in indicators)
-    # Also flag if the body is almost empty (< 2 KB is a shell)
     is_tiny = len(html) < ANGULAR_SHELL_MAX_SIZE
     return has_angular or is_tiny
 

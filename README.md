@@ -69,4 +69,26 @@ Bids-Agent/
    **Export Selected**. A styled `.xlsx` file is downloaded automatically.
 5. **History** — the **History** tab shows all past searches. Click **Load**
    to reload results or **Export** to re-export any past search.
- 
+
+## Optional: SAM.gov API Key
+
+Without an API key the SAM.gov free tier allows only ~10 requests per day.
+If you hit that limit the scraper returns a `403 Forbidden` error.
+
+To get a free API key:
+1. Log in at [sam.gov](https://sam.gov) (free registration)
+2. Go to **My SAM → System Account** and create a public-access key
+3. Set the environment variable before starting the app:
+
+```bash
+# macOS / Linux
+export SAM_GOV_API_KEY=your_key_here
+python main.py
+
+# Windows
+set SAM_GOV_API_KEY=your_key_here
+python main.py
+```
+
+The app detects the key automatically — no other configuration needed.
+
