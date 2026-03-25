@@ -775,7 +775,41 @@ function buildDiagHtml(diag, sourceKey) {
     <span class="debug-val ${diag.error ? "err" : "ok"}">${diag.error ? escHtml(diag.error) : "None ✔"}</span>
   </div>`;
 
-  // BidNet-specific: direct API attempt log
+  // ── BidNet: Playwright attempt ────────────────────────────────────────────
+  if (diag.playwright_attempt) {
+    const pw = diag.playwright_attempt;
+    const pwInstalled = !pw.error || !pw.error.includes("not installed");
+    const pwOk = pw.elements_found > 0;
+    const pwCls = pwOk ? "ok" : (pw.error ? "err" : "warn");
+
+    if (!pwInstalled || diag.playwright_not_installed) {
+      // Most important case: user just needs to run the install command
+      html += `<div class="debug-section-title">⚠️ Playwright Setup Required</div>
+        <div class="source-errors" style="margin-top:0;padding:1rem">
+          <p style="font-size:.92rem;font-weight:600;color:var(--clr-text);margin-bottom:.6rem">
+            BidNet Direct requires Playwright (a headless browser) because their site loads results via JavaScript.
+            Install it once with these two commands, then restart the app:
+          </p>
+          <pre style="background:#1e1e2e;color:#cdd6f4;padding:.8rem 1rem;border-radius:6px;font-size:.88rem;overflow-x:auto">pip install playwright
+playwright install chromium
+</pre>
+        </div>`;
+    } else {
+      html += `<div class="debug-section-title">Playwright Headless Browser</div>
+        <div class="debug-attempt">
+          <div class="debug-attempt-url">${escHtml(pw.url || pw.method || "Playwright")}</div>
+          <div class="debug-attempt-status ${pwCls}">
+            Status: ${pw.http_status ?? "N/A"} &nbsp;|&nbsp;
+            Size: ${pw.response_size != null ? (pw.response_size / 1024).toFixed(1) + " KB" : "N/A"} &nbsp;|&nbsp;
+            Selector: ${escHtml(pw.selector_used || "N/A")} &nbsp;|&nbsp;
+            Found: ${pw.elements_found ?? 0}
+          </div>
+          ${pw.error ? `<div class="debug-val err" style="margin-top:.3rem;font-size:.83rem">${escHtml(pw.error)}</div>` : ""}
+        </div>`;
+    }
+  }
+
+  // ── BidNet: direct API attempt log ────────────────────────────────────────
   if (diag.attempts && diag.attempts.length) {
     html += `<div class="debug-section-title">Direct API Endpoint Attempts</div>
       <div class="debug-attempts">`;
@@ -798,7 +832,7 @@ function buildDiagHtml(diag, sourceKey) {
     html += `</div>`;
   }
 
-  // BidNet-specific: DuckDuckGo fallback result
+  // ── BidNet: DuckDuckGo fallback ───────────────────────────────────────────
   if (diag.duckduckgo_fallback) {
     const fb = diag.duckduckgo_fallback;
     const fbCls = fb.error ? "err" : (fb.elements_found > 0 ? "ok" : "warn");
@@ -813,7 +847,22 @@ function buildDiagHtml(diag, sourceKey) {
       </div>`;
   }
 
-  // DuckDuckGo per-query details
+  // ── BidNet: Bing fallback ─────────────────────────────────────────────────
+  if (diag.bing_fallback) {
+    const bf = diag.bing_fallback;
+    const bfCls = bf.error ? "err" : (bf.elements_found > 0 ? "ok" : "warn");
+    html += `<div class="debug-section-title">Bing site:bidnetdirect.com Fallback</div>
+      <div class="debug-attempt">
+        <div class="debug-attempt-url">${escHtml(bf.query || "")}</div>
+        <div class="debug-attempt-status ${bfCls}">
+          Status: ${bf.http_status ?? "N/A"} &nbsp;|&nbsp;
+          Found: ${bf.elements_found ?? 0} results
+        </div>
+        ${bf.error ? `<div class="debug-val err" style="margin-top:.3rem;font-size:.83rem">${escHtml(bf.error)}</div>` : ""}
+      </div>`;
+  }
+
+  // DuckDuckGo per-query details (Web Search source)
   if (diag.per_query && diag.per_query.length) {
     html += `<div class="debug-section-title">Per-Query Details</div>
       <div class="debug-attempts">`;
@@ -844,12 +893,22 @@ function buildDiagHtml(diag, sourceKey) {
 
 function buildGuidance(diag, sourceKey) {
   const error = (diag.error || "").toLowerCase();
+  const pwAttempt = diag.playwright_attempt || {};
+  const pwError = (pwAttempt.error || "").toLowerCase();
   let tip = "";
 
-  if (error.includes("connection failed") || error.includes("cannot reach")) {
+  // Playwright not installed — this is the primary fix for BidNet
+  if (diag.playwright_not_installed ||
+      pwError.includes("not installed") || pwError.includes("executable")) {
+    // Already shown as a prominent setup block above; no duplicate tip needed
+    return "";
+  } else if (pwError.includes("chromium") && pwError.includes("missing")) {
+    tip = `<strong>Chromium binary missing:</strong> Playwright is installed but the browser binary wasn't downloaded.
+           Run: <code>playwright install chromium</code> and restart the app.`;
+  } else if (error.includes("connection failed") || error.includes("cannot reach")) {
     tip = `<strong>Connection blocked:</strong> The server cannot reach ${escHtml(_sourceLabel(sourceKey))}. 
-           This usually means the domain is blocked by a firewall, proxy, or the host machine's network. 
-           Try running the app directly on your local machine (not in a sandboxed environment).`;
+           This usually means the domain is blocked by a firewall or proxy. 
+           Try running the app directly on your local machine.`;
   } else if (error.includes("rate limit") || (diag.http_status === 429)) {
     tip = `<strong>Rate limited (HTTP 429):</strong> Too many requests were sent. Wait 1–2 minutes and try again.
            For SAM.gov, set the <code>SAM_GOV_API_KEY</code> environment variable — 
@@ -860,15 +919,6 @@ function buildGuidance(diag, sourceKey) {
            Set the <code>SAM_GOV_API_KEY</code> environment variable with a free key from 
            <a href="https://sam.gov/profile/details" target="_blank" rel="noopener">sam.gov/profile/details</a>.
            Then restart the app. The free tier without a key allows only ~10 requests/day.`;
-  } else if (error.includes("415") || error.includes("cdn") || error.includes("waf")) {
-    tip = `<strong>CDN/bot-protection block (HTTP 415):</strong> BidNet's server rejected the request.
-           The DuckDuckGo <code>site:bidnetdirect.com</code> fallback was tried automatically —
-           if it also failed, try searching bidnetdirect.com directly in your browser and 
-           export the results manually.`;
-  } else if (error.includes("angular shell") || error.includes("javascript")) {
-    tip = `<strong>JavaScript-rendered site:</strong> ${escHtml(_sourceLabel(sourceKey))} loads its results 
-           via JavaScript. Direct API access failed. The DuckDuckGo <code>site:bidnetdirect.com</code> 
-           fallback should still return indexed BidNet solicitations.`;
   } else if (diag.elements_found === 0 && !diag.error) {
     tip = `<strong>No matching results:</strong> The source was reached successfully but returned 0 results 
            for your keywords. Try a single keyword (e.g. <em>Translation</em>) instead of all keywords at once.`;

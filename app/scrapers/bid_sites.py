@@ -4,29 +4,29 @@ Scrapers for public-sector bid aggregator websites.
 BidNet Direct
 -------------
 BidNet Direct renders its search results via AngularJS (client-side JavaScript).
-A plain GET request to their HTML route returns only the Angular application
-shell — the actual solicitation data is fetched by JavaScript at runtime.
+A plain HTTP request returns only the Angular application shell — real data is
+fetched by JavaScript at runtime.
 
 Strategy (tried in order):
-1. Several known JSON REST API patterns (all returned 404 in testing).
-2. The public HTML search page via GET and POST (returns 415 from their CDN).
-3. DuckDuckGo `site:bidnetdirect.com` search — BidNet pages are publicly
-   indexed, so this reliably returns real solicitations without needing
-   direct API access.  Results link directly to the BidNet solicitation pages.
+0. Playwright headless Chromium — executes JavaScript exactly like a real browser.
+   Requires: pip install playwright && playwright install chromium
+1. Several known JSON REST API patterns (all return 404 in practice).
+2. The public HTML search page via GET and POST (CDN returns 415/405).
+3. DuckDuckGo `site:bidnetdirect.com` — BidNet pages are publicly indexed.
+4. Bing `site:bidnetdirect.com` — used when DuckDuckGo is rate-limited.
 """
 
 import re
 import time
 import requests
 from bs4 import BeautifulSoup
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from urllib.parse import urljoin, urlparse, quote
 from .base_scraper import BaseScraper, DIAG_PREVIEW_CHARS
 # web_search symbols used by the DuckDuckGo site-search fallback
 from .web_search import DDG_URL, RESULT_SELECTORS, _extract_url, _domain as _ddg_domain, HEADERS as DDG_HEADERS
 
 # Minimum HTML size (bytes) that suggests a real page vs an Angular app shell.
-# Angular shells are tiny stub files (< ~2 KB) before JS hydration.
 ANGULAR_SHELL_MAX_SIZE = 2000
 
 # Browser-like headers for HTML page requests
@@ -52,6 +52,33 @@ API_HEADERS = {
 # Keep HEADERS alias for GenericBidScraper compatibility
 HEADERS = BROWSER_HEADERS
 
+# CSS selectors tried in order on BidNet's JavaScript-rendered DOM.
+# AngularJS (ng-repeat) renders real <tr> rows; Angular 2+ uses component tags.
+BIDNET_ROW_SELECTORS = [
+    "tr[ng-repeat]",                        # AngularJS ng-repeat rows
+    "tr[data-ng-repeat]",                   # alternate AngularJS syntax
+    ".solicitation-list-item",
+    ".solicitation-row",
+    "app-solicitation-item",                # Angular 2+ component
+    "app-bid-item",
+    ".bid-item",
+    ".opportunity-item",
+    "tbody tr",                             # generic table fallback
+]
+
+# ─── Playwright setup instructions shown to users ────────────────────────────
+PLAYWRIGHT_SETUP = (
+    "pip install playwright && playwright install chromium"
+)
+PLAYWRIGHT_NOT_INSTALLED = (
+    "Playwright is not installed. "
+    "Playwright is required for BidNet Direct because their site loads results "
+    "via JavaScript. Install it once with:\n\n"
+    "    pip install playwright\n"
+    "    playwright install chromium\n\n"
+    "Then restart the app."
+)
+
 
 # ─── BidNet Direct ───────────────────────────────────────────────────────────
 
@@ -59,8 +86,7 @@ class BidNetScraper(BaseScraper):
     SOURCE_NAME = "BidNet Direct"
     BASE_URL = "https://www.bidnetdirect.com"
 
-    # Candidate JSON API endpoints tried in order.
-    # BidNet uses an AngularJS SPA — actual data comes from internal JSON endpoints.
+    # Candidate JSON API endpoints tried as a quick check (mostly 404 in practice)
     CANDIDATE_APIS = [
         "https://www.bidnetdirect.com/api/v1/public/solicitations/search",
         "https://www.bidnetdirect.com/api/v1/publicSolicitations",
@@ -68,7 +94,6 @@ class BidNetScraper(BaseScraper):
         "https://www.bidnetdirect.com/api/v2/public/solicitations/search",
     ]
 
-    # HTML search page — tried last; returns 415 when CDN rejects bot UA
     HTML_SEARCH_URL = "https://www.bidnetdirect.com/public/solicitations/search"
 
     def search(self, keywords: str, search_types: List[str], max_results: int = 25) -> List[Dict]:
@@ -89,8 +114,28 @@ class BidNetScraper(BaseScraper):
             "error": None,
             "elements_found": 0,
             "response_preview": None,
+            "playwright_attempt": None,
             "attempts": [],
+            "duckduckgo_fallback": None,
+            "bing_fallback": None,
         }
+
+        # ── Step 0: Playwright headless browser (primary — executes JS) ────────
+        pw_results, pw_diag = self._playwright_bidnet_search(keywords, max_results)
+        diag["playwright_attempt"] = pw_diag
+
+        if pw_results:
+            diag["url"] = pw_diag.get("url")
+            diag["http_status"] = pw_diag.get("http_status")
+            diag["response_size"] = pw_diag.get("response_size")
+            diag["elements_found"] = len(pw_results)
+            return pw_results, diag
+
+        # Playwright failed or not installed — record the error and continue
+        if pw_diag.get("error"):
+            # Surface "not installed" prominently so the user knows what to do
+            if "not installed" in pw_diag["error"] or "executable" in pw_diag["error"].lower():
+                diag["playwright_not_installed"] = True
 
         # ── Step 1: try JSON API endpoints ────────────────────────────────────
         for api_url in self.CANDIDATE_APIS:
@@ -183,10 +228,10 @@ class BidNetScraper(BaseScraper):
                 attempt["content_type"] = resp.headers.get("Content-Type", "")
                 attempt["response_preview"] = resp.text[:DIAG_PREVIEW_CHARS]
 
-                if resp.status_code == 415:
+                if resp.status_code in (415, 405):
                     attempt["error"] = (
-                        f"HTTP 415 — server rejected the {method} request (CDN/WAF bot protection). "
-                        "BidNet requires a real browser session with cookies and JS execution."
+                        f"HTTP {resp.status_code} — server rejected the {method} request "
+                        "(CDN/WAF bot protection). BidNet requires a real browser."
                     )
                     diag["attempts"].append(attempt)
                     continue
@@ -222,9 +267,9 @@ class BidNetScraper(BaseScraper):
 
             diag["attempts"].append(attempt)
 
-        # ── Step 3: DuckDuckGo site:bidnetdirect.com fallback ─────────────────
-        fallback_results, fallback_diag = self._duckduckgo_site_search(
-            keywords, search_types, max_results
+        # ── Step 3: DuckDuckGo site:bidnetdirect.com ──────────────────────────
+        fallback_results, fallback_diag = self._site_search(
+            "DuckDuckGo", keywords, max_results
         )
         diag["duckduckgo_fallback"] = fallback_diag
 
@@ -234,29 +279,239 @@ class BidNetScraper(BaseScraper):
             diag["error"] = None
             return fallback_results, diag
 
-        # All methods exhausted
-        api_errors = "; ".join(
-            f"[{a['url'].split('/')[-1]}] {a.get('error', 'unknown')}"
-            for a in diag["attempts"]
-        )
-        diag["error"] = (
-            "All BidNet Direct scraping methods failed. "
-            f"Direct API attempts: {api_errors}. "
-            f"DuckDuckGo fallback: {fallback_diag.get('error', 'returned 0 results')}."
-        )
+        # ── Step 4: Bing site:bidnetdirect.com ────────────────────────────────
+        bing_results, bing_diag = self._site_search("Bing", keywords, max_results)
+        diag["bing_fallback"] = bing_diag
+
+        if bing_results:
+            diag["url"] = "Bing site:bidnetdirect.com (fallback)"
+            diag["elements_found"] = len(bing_results)
+            diag["error"] = None
+            return bing_results, diag
+
+        # All methods exhausted — compose a helpful error message
+        if diag.get("playwright_not_installed"):
+            diag["error"] = (
+                "BidNet Direct search requires Playwright (headless browser). "
+                "Install it once with:\n\n"
+                "    pip install playwright\n"
+                "    playwright install chromium\n\n"
+                "Then restart the app and search again."
+            )
+        else:
+            pw_err = pw_diag.get("error", "unknown error")
+            diag["error"] = (
+                f"All BidNet Direct scraping methods failed. "
+                f"Playwright: {pw_err}. "
+                f"DuckDuckGo fallback: {fallback_diag.get('error', '0 results')}. "
+                f"Bing fallback: {bing_diag.get('error', '0 results')}."
+            )
         return [], diag
 
-    def _duckduckgo_site_search(self, keywords: str, search_types: List[str],
-                                 max_results: int) -> Tuple[List[Dict], Dict[str, Any]]:
+    # ── Playwright headless browser ───────────────────────────────────────────
+
+    def _playwright_bidnet_search(self, keywords: str, max_results: int
+                                   ) -> Tuple[List[Dict], Dict[str, Any]]:
         """
-        Search DuckDuckGo for `site:bidnetdirect.com <keywords>`.
-        BidNet solicitation pages are publicly indexed, so this returns real results
-        when BidNet's own API is inaccessible.
+        Use Playwright headless Chromium to navigate BidNet, execute its
+        JavaScript, and extract the rendered solicitation list.
+
+        Install once:
+            pip install playwright
+            playwright install chromium
         """
-        query = f"site:bidnetdirect.com {keywords} solicitation"
         diag: Dict[str, Any] = {
+            "method": "Playwright headless Chromium",
+            "url": None,
+            "http_status": None,
+            "response_size": None,
+            "error": None,
+            "elements_found": 0,
+            "selector_used": None,
+            "response_preview": None,
+        }
+
+        # ── check Playwright is importable ────────────────────────────────────
+        try:
+            from playwright.sync_api import sync_playwright
+            from playwright.sync_api import TimeoutError as PWTimeout
+            from playwright._impl._errors import Error as PWError
+        except ImportError:
+            diag["error"] = PLAYWRIGHT_NOT_INSTALLED
+            return [], diag
+
+        search_url = f"{self.BASE_URL}/public/solicitations?keywords={quote(keywords)}"
+        diag["url"] = search_url
+
+        try:
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(headless=True, args=["--no-sandbox"])
+                ctx = browser.new_context(
+                    user_agent=BROWSER_HEADERS["User-Agent"],
+                    viewport={"width": 1280, "height": 800},
+                    java_script_enabled=True,
+                )
+                page = ctx.new_page()
+
+                # Navigate and wait for network activity to settle so Angular
+                # has time to fetch and render the solicitation list
+                response = page.goto(search_url, wait_until="networkidle", timeout=20_000)
+                if response:
+                    diag["http_status"] = response.status
+
+                # Try to find the solicitation list container.
+                # Per-selector timeout is short (1.5 s) because the DOM is already fully
+                # rendered after networkidle — elements are either present or they aren't.
+                found_sel: Optional[str] = None
+                for sel in BIDNET_ROW_SELECTORS:
+                    try:
+                        page.wait_for_selector(sel, timeout=1_500)
+                        found_sel = sel
+                        break
+                    except PWTimeout:
+                        continue
+
+                page_html = page.content()
+                diag["response_size"] = len(page_html.encode())
+                diag["response_preview"] = page_html[:DIAG_PREVIEW_CHARS]
+
+                if not found_sel:
+                    # Try a broader BeautifulSoup parse as last-ditch
+                    results = self._parse_html(page_html, search_url, max_results)
+                    if results:
+                        diag["elements_found"] = len(results)
+                        diag["selector_used"] = "BeautifulSoup (broad)"
+                        browser.close()
+                        return results, diag
+
+                    diag["error"] = (
+                        "Playwright loaded BidNet and waited for JavaScript to render, "
+                        "but no solicitation elements were found. "
+                        "The site's DOM structure may have changed."
+                    )
+                    browser.close()
+                    return [], diag
+
+                diag["selector_used"] = found_sel
+
+                # Extract structured data from the rendered DOM via JavaScript
+                rows_data: List[Dict] = page.evaluate(
+                    """(sel) => {
+                        const rows = Array.from(document.querySelectorAll(sel));
+                        return rows.slice(0, 50).map(row => {
+                            const links = Array.from(row.querySelectorAll('a'));
+                            const cells = Array.from(row.querySelectorAll('td'));
+                            const firstLink = links[0] || null;
+                            const getText = el => el ? el.textContent.replace(/\\s+/g, ' ').trim() : '';
+                            // Look for common field labels
+                            const findField = (labels) => {
+                                for (const label of labels) {
+                                    const el = row.querySelector(
+                                        `[data-label*="${label}"], .${label.toLowerCase()}, ` +
+                                        `[class*="${label.toLowerCase()}"]`
+                                    );
+                                    if (el) return getText(el);
+                                }
+                                return '';
+                            };
+                            return {
+                                title: getText(row.querySelector(
+                                    '.title, .solicitation-title, .bid-title, h3, h4, ' +
+                                    '[class*="title"], [class*="name"]'
+                                )) || (firstLink ? getText(firstLink) : ''),
+                                url: firstLink ? firstLink.href : '',
+                                number: findField(['number', 'solicitationNumber', 'bidNumber']),
+                                agency: findField(['agency', 'organization', 'buyer']),
+                                due_date: findField(['due', 'closing', 'deadline', 'responseDate']),
+                                city: findField(['city']),
+                                state: findField(['state']),
+                                description: getText(row.querySelector(
+                                    '.description, .summary, .details, p'
+                                )),
+                                cells: cells.slice(0, 8).map(c => getText(c)),
+                                full_text: getText(row).slice(0, 500),
+                            };
+                        });
+                    }""",
+                    found_sel,
+                )
+                browser.close()
+        except PWError as exc:
+            err = str(exc)
+            if "executable" in err.lower() or "chromium" in err.lower():
+                diag["error"] = (
+                    "Playwright is installed but the Chromium browser binary is missing. "
+                    "Run once: playwright install chromium"
+                )
+            else:
+                diag["error"] = f"Playwright browser error: {exc}"
+            return [], diag
+        except Exception as exc:
+            diag["error"] = f"Playwright error: {exc}"
+            return [], diag
+
+        # Parse the extracted rows into our result schema
+        results = []
+        for item in rows_data[:max_results]:
+            if not isinstance(item, dict):
+                continue
+
+            title = item.get("title", "").strip()
+            if not title:
+                # Fall back to first non-empty cell text
+                cells = item.get("cells", [])
+                title = next((c for c in cells if len(c) > 5), "")
+            if not title:
+                continue
+
+            r = self.empty_result()
+            r["title"]       = title
+            r["number"]      = item.get("number", "")
+            r["company"]     = item.get("agency", "")
+            r["city"]        = item.get("city", "")
+            r["state"]       = item.get("state", "")
+            r["due_date"]    = (item.get("due_date") or "")[:10]
+            r["description"] = item.get("description") or item.get("full_text", "")[:300]
+            r["source_url"]  = item.get("url", "")
+            r["site"]        = self.BASE_URL
+            r["source_name"] = self.SOURCE_NAME
+            r["raw_data"]    = {"cells": item.get("cells", []), "method": "playwright"}
+
+            # If the scraper extracted table cells but no specific fields,
+            # try to infer title/agency from cell content
+            cells = item.get("cells", [])
+            if not r["company"] and len(cells) > 1:
+                r["company"] = cells[1]
+            if not r["due_date"] and len(cells) > 3:
+                # Cells with date-like content (YYYY or MM/DD)
+                for cell in cells[2:]:
+                    if re.search(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2}', cell):
+                        r["due_date"] = cell[:10]
+                        break
+
+            results.append(r)
+
+        diag["elements_found"] = len(results)
+        if not results:
+            diag["error"] = (
+                f"Playwright found elements matching '{found_sel}' "
+                "but could not extract any titled solicitations from them."
+            )
+        return results, diag
+
+    # ── Search-engine site: fallback ──────────────────────────────────────────
+
+    def _site_search(self, engine: str, keywords: str, max_results: int
+                     ) -> Tuple[List[Dict], Dict[str, Any]]:
+        """
+        Search `site:bidnetdirect.com <keywords>` via DuckDuckGo or Bing.
+        BidNet solicitation pages are publicly indexed, so this returns real
+        results when their own site blocks direct scraping.
+        """
+        query = f"site:bidnetdirect.com {keywords}"
+        diag: Dict[str, Any] = {
+            "engine": engine,
             "query": query,
-            "method": "DuckDuckGo site:bidnetdirect.com",
             "http_status": None,
             "response_size": None,
             "error": None,
@@ -266,13 +521,25 @@ class BidNetScraper(BaseScraper):
 
         try:
             session = requests.Session()
-            resp = session.post(
-                DDG_URL,
-                data={"q": query, "kl": "us-en"},
-                headers=DDG_HEADERS,
-                timeout=15,
-                allow_redirects=True,
-            )
+            if engine == "DuckDuckGo":
+                resp = session.post(
+                    DDG_URL,
+                    data={"q": query, "kl": "us-en"},
+                    headers=DDG_HEADERS,
+                    timeout=15,
+                    allow_redirects=True,
+                )
+            else:
+                # Bing web search
+                resp = session.get(
+                    "https://www.bing.com/search",
+                    params={"q": query, "count": max_results},
+                    headers={
+                        **BROWSER_HEADERS,
+                        "Referer": "https://www.bing.com/",
+                    },
+                    timeout=15,
+                )
             diag["http_status"] = resp.status_code
             diag["response_size"] = len(resp.content)
             diag["response_preview"] = resp.text[:DIAG_PREVIEW_CHARS]
@@ -289,62 +556,88 @@ class BidNetScraper(BaseScraper):
 
         soup = BeautifulSoup(resp.text, "lxml")
 
-        # Find matching selector
-        title_sel = RESULT_SELECTORS[0][0]
-        snippet_sel = RESULT_SELECTORS[0][1]
+        if engine == "DuckDuckGo":
+            results = self._parse_ddg_results(soup, query, max_results)
+        else:
+            results = self._parse_bing_results(soup, query, max_results)
+
+        diag["elements_found"] = len(results)
+        if not results and not diag.get("error"):
+            diag["error"] = (
+                f"{engine} returned a page but 0 BidNet results were found. "
+                "The search engine may have returned a CAPTCHA or rate-limit page."
+            )
+        return results, diag
+
+    def _parse_ddg_results(self, soup: BeautifulSoup, query: str, max_results: int) -> List[Dict]:
+        results = []
+        title_sel, snippet_sel = RESULT_SELECTORS[0]
         for ts, ss in RESULT_SELECTORS:
             if soup.select(ts):
                 title_sel, snippet_sel = ts, ss
                 break
 
-        results = []
         for result_div in soup.select(".result, .web-result")[:max_results]:
-            r = self.empty_result()
+            r = self._result_from_search_div(result_div, title_sel, snippet_sel, query)
+            if r:
+                results.append(r)
+        return results
 
-            title_tag = result_div.select_one(title_sel)
+    def _parse_bing_results(self, soup: BeautifulSoup, query: str, max_results: int) -> List[Dict]:
+        """Parse Bing search result HTML."""
+        results = []
+        # Bing uses <li class="b_algo"> for organic results
+        for item in soup.select("li.b_algo")[:max_results]:
+            title_tag = item.select_one("h2 a")
+            snippet_tag = item.select_one(".b_caption p, .b_algoSlug")
             if not title_tag:
                 continue
-
-            r["title"] = title_tag.get_text(strip=True)
-            href = title_tag.get("href", "")
-            real_url = _extract_url(href)
-            r["source_url"] = real_url
-            r["site"] = self.BASE_URL
-            r["source_name"] = self.SOURCE_NAME
-
-            snippet_tag = result_div.select_one(snippet_sel)
-            if snippet_tag:
-                r["description"] = snippet_tag.get_text(strip=True)[:300]
-
-            r["raw_data"] = {"query": query, "method": "duckduckgo_site_search"}
-
-            # Only keep results that point to BidNet (check the parsed hostname,
-            # not a substring, to avoid matching URLs like evil.com/bidnetdirect.com)
+            real_url = title_tag.get("href", "")
             try:
                 hostname = urlparse(real_url).netloc.lower()
             except Exception:
                 hostname = ""
-            if r["title"] and (hostname == "www.bidnetdirect.com" or
-                                hostname == "bidnetdirect.com"):
-                results.append(r)
+            if hostname not in ("www.bidnetdirect.com", "bidnetdirect.com"):
+                continue
+            r = self.empty_result()
+            r["title"]       = title_tag.get_text(strip=True)
+            r["source_url"]  = real_url
+            r["site"]        = self.BASE_URL
+            r["source_name"] = self.SOURCE_NAME
+            r["description"] = snippet_tag.get_text(strip=True)[:300] if snippet_tag else ""
+            r["raw_data"]    = {"query": query, "method": "bing_site_search"}
+            results.append(r)
+        return results
 
-        diag["elements_found"] = len(results)
-        if not results and not diag.get("error"):
-            if not soup.select(title_sel):
-                diag["error"] = (
-                    "DuckDuckGo returned no results — the page may have no matching entries "
-                    "or DuckDuckGo rate-limited the request."
-                )
-            else:
-                diag["error"] = (
-                    "DuckDuckGo returned results but none pointed to bidnetdirect.com. "
-                    "BidNet pages may not be indexed for these keywords."
-                )
-        return results, diag
+    def _result_from_search_div(self, result_div: Any, title_sel: str, snippet_sel: str,
+                                  query: str) -> Optional[Dict]:
+        """Convert a DuckDuckGo result div into a result dict, keeping BidNet URLs only."""
+        r = self.empty_result()
+        title_tag = result_div.select_one(title_sel)
+        if not title_tag:
+            return None
+        r["title"] = title_tag.get_text(strip=True)
+        href = title_tag.get("href", "")
+        real_url = _extract_url(href)
+        try:
+            hostname = urlparse(real_url).netloc.lower()
+        except Exception:
+            hostname = ""
+        if hostname not in ("www.bidnetdirect.com", "bidnetdirect.com"):
+            return None
+        r["source_url"]  = real_url
+        r["site"]        = self.BASE_URL
+        r["source_name"] = self.SOURCE_NAME
+        snippet_tag = result_div.select_one(snippet_sel)
+        if snippet_tag:
+            r["description"] = snippet_tag.get_text(strip=True)[:300]
+        r["raw_data"] = {"query": query, "method": "ddg_site_search"}
+        return r
+
+    # ── JSON / HTML parsers ────────────────────────────────────────────────────
 
     @staticmethod
     def _parse_json(data: Any, max_results: int) -> List[Dict]:
-        """Parse BidNet Direct JSON API response (several possible shapes)."""
         items: List[Any] = []
         if isinstance(data, list):
             items = data
@@ -377,21 +670,11 @@ class BidNetScraper(BaseScraper):
 
     @staticmethod
     def _parse_html(html: str, base_url: str, max_results: int) -> List[Dict]:
-        """Parse an HTML search results page."""
         soup = BeautifulSoup(html, "lxml")
         results = []
 
-        row_selectors = [
-            "div.solicitation-item",
-            "tr.solicitation-row",
-            "tr.bid-row",
-            ".bid-item",
-            "div.opportunity-item",
-            "li.solicitation",
-            "div.result-item",
-        ]
         rows = []
-        for sel in row_selectors:
+        for sel in BIDNET_ROW_SELECTORS:
             rows = soup.select(sel)
             if rows:
                 break
@@ -433,10 +716,7 @@ class BidNetScraper(BaseScraper):
 # ─── Generic bid-site scraper (fallback) ─────────────────────────────────────
 
 class GenericBidScraper(BaseScraper):
-    """
-    Generic scraper that attempts to extract bid-like table rows from any URL.
-    Used as a fallback for sites not covered by dedicated scrapers.
-    """
+    """Generic scraper that extracts bid-like table rows from any URL."""
 
     SOURCE_NAME = "Generic"
 
@@ -460,13 +740,11 @@ class GenericBidScraper(BaseScraper):
                 results.extend(parsed[: max_results - len(results)])
             except requests.RequestException:
                 continue
-
         return results
 
     def _parse_table(self, html: str, source_name: str, base_url: str) -> List[Dict]:
         soup = BeautifulSoup(html, "lxml")
         results = []
-
         for row in soup.select("table tr"):
             cells = row.find_all("td")
             if len(cells) < 2:
@@ -488,7 +766,6 @@ class GenericBidScraper(BaseScraper):
             r["raw_data"] = {"cells": texts[:8]}
             if r["title"]:
                 results.append(r)
-
         return results
 
 
@@ -527,3 +804,4 @@ def _domain(url: str) -> str:
         return urlparse(url).netloc or url
     except Exception:
         return url
+

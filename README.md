@@ -23,15 +23,24 @@ RFIs using configurable keywords and exports the results to Excel.
 ## Quick Start
 
 ```bash
-# 1. Install dependencies
+# 1. Install dependencies (includes Playwright for BidNet Direct)
 pip install -r requirements.txt
 
-# 2. Run the app
+# 2. Install the Playwright browser binary (one-time, ~300 MB)
+playwright install chromium
+
+# 3. Run the app
 python main.py
 
-# 3. Open in your browser
+# 4. Open in your browser
 # http://localhost:5000
 ```
+
+> **Why is `playwright install chromium` needed?**
+> BidNet Direct is a JavaScript-rendered website (AngularJS SPA). A plain HTTP
+> request returns only an empty HTML shell — no results. Playwright launches a
+> real headless Chromium browser that executes JavaScript just like your browser
+> does, so it can see and extract the actual search results.
 
 ## Project Structure
 
